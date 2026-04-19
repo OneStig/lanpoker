@@ -1,0 +1,320 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LAN Poker (basic)</title>
+</head>
+<body>
+<h1>LAN Poker</h1>
+
+<!-- ============ JOIN ============ -->
+<div id="join-section">
+  <h2>Join</h2>
+  <label>Username: <input id="username" type="text"></label><br>
+  <label>Requested stack: <input id="stack" type="number" value="1000"></label><br>
+  <button id="join-btn">Join</button>
+  <div id="join-msg"></div>
+</div>
+
+<hr>
+
+<!-- ============ STATUS ============ -->
+<div id="status">Status: not connected</div>
+<div id="my-role"></div>
+<div id="my-hole"></div>
+
+<hr>
+
+<!-- ============ SEAT REQUEST (spectators) ============ -->
+<div id="seat-request-section" style="display:none">
+  <button id="request-seat-btn">Request a seat</button>
+</div>
+
+<!-- ============ ACTIONS (your turn) ============ -->
+<div id="actions-section" style="display:none">
+  <h2>Your turn</h2>
+  <button id="act-fold">Fold</button>
+  <button id="act-check">Check</button>
+  <button id="act-call">Call</button>
+  <br><br>
+  <label>Bet/raise to: <input id="bet-amount" type="number"></label>
+  <span id="bet-range"></span><br>
+  <button id="act-bet">Bet</button>
+  <button id="act-raise">Raise</button>
+</div>
+
+<hr>
+
+<!-- ============ STATE DUMP ============ -->
+<h2>Game state</h2>
+<pre id="state-text" style="white-space:pre-wrap; font-family:monospace; background:#f0f0f0; padding:8px; border:1px solid #ccc;"></pre>
+
+<hr>
+
+<!-- ============ EVENT LOG ============ -->
+<h2>Event log</h2>
+<pre id="log" style="white-space:pre-wrap; font-family:monospace; background:#f0f0f0; padding:8px; border:1px solid #ccc; max-height:240px; overflow-y:auto;"></pre>
+
+<!-- Socket.IO client from CDN. Keep this aligned with the server's socketio version (v5 -> client v4). -->
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+(() => {
+  // ---------- state ----------
+  let username = null;
+  let myHole = [];
+  let lastState = null;
+  let lastLegal = null;
+
+  // ---------- dom ----------
+  const $ = (id) => document.getElementById(id);
+  const logEl = $("log");
+  const stateEl = $("state-text");
+  const statusEl = $("status");
+  const roleEl = $("my-role");
+  const holeEl = $("my-hole");
+  const joinSec = $("join-section");
+  const joinMsg = $("join-msg");
+  const seatReqSec = $("seat-request-section");
+  const actionsSec = $("actions-section");
+  const betInput = $("bet-amount");
+  const betRange = $("bet-range");
+
+  function log(msg) {
+    const ts = new Date().toLocaleTimeString();
+    logEl.textContent += `[${ts}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  // ---------- socket ----------
+  const socket = io({ transports: ["websocket", "polling"] });
+
+  socket.on("connect", () => {
+    statusEl.textContent = "Status: connected";
+    // If we already have a username (page refresh), re-attach.
+    const saved = sessionStorage.getItem("poker-username");
+    if (saved) {
+      username = saved;
+      socket.emit("hello", { username });
+      joinSec.style.display = "none";
+      log(`Reconnected as ${username}`);
+    }
+  });
+
+  socket.on("disconnect", () => {
+    statusEl.textContent = "Status: disconnected";
+  });
+
+  socket.on("join_result", (msg) => {
+    joinMsg.textContent = msg.message || "";
+    if (msg.ok) {
+      username = msg.username;
+      sessionStorage.setItem("poker-username", username);
+      joinSec.style.display = "none";
+      log(`Joined as ${username}. ${msg.message}`);
+    } else {
+      log(`Join failed: ${msg.message}`);
+    }
+  });
+
+  socket.on("action_result", (msg) => {
+    if (!msg.ok) log(`Action rejected: ${msg.message}`);
+  });
+
+  socket.on("legal_actions", (la) => {
+    lastLegal = la;
+    renderActions();
+  });
+
+  socket.on("private", (msg) => {
+    if (msg.type === "hole") {
+      myHole = msg.cards || [];
+      renderRole();
+    }
+  });
+
+  socket.on("table", (payload) => {
+    if (payload.type === "state") {
+      lastState = payload.state;
+      if (payload.new_hand) {
+        myHole = []; // will arrive via private
+        log("--- New hand started ---");
+      }
+      renderAll();
+      // If it's our turn, ask for legal actions.
+      if (isMyTurn()) {
+        socket.emit("legal_actions", { username });
+      } else {
+        lastLegal = null;
+        renderActions();
+      }
+    } else if (payload.type === "session_ended") {
+      log("Session ended. Final stacks:");
+      for (const s of payload.final.seated) {
+        log(`  ${s.username}: ${s.stack}`);
+      }
+      for (const u of payload.final.spectators) {
+        log(`  ${u} (spectator)`);
+      }
+    }
+  });
+
+  // ---------- rendering ----------
+  function isSeated() {
+    if (!lastState || !username) return false;
+    return lastState.seats.some((s) => s.username === username);
+  }
+  function isSpectator() {
+    if (!lastState || !username) return false;
+    return lastState.spectators.includes(username);
+  }
+  function isPending() {
+    // Server doesn't expose pending publicly; infer from being known but neither seated nor spectator.
+    return username && !isSeated() && !isSpectator();
+  }
+  function isMyTurn() {
+    return lastState && lastState.hand && lastState.hand.to_act === username;
+  }
+
+  function renderRole() {
+    if (!username) { roleEl.textContent = ""; holeEl.textContent = ""; return; }
+    let role = "unknown";
+    if (isSeated()) role = "seated";
+    else if (isSpectator()) role = "spectator";
+    else if (isPending()) role = "waiting for host approval";
+    roleEl.textContent = `You: ${username} (${role})`;
+    holeEl.textContent = (isSeated() && myHole.length)
+      ? `Your hole cards: ${myHole.join(" ")}`
+      : "";
+    seatReqSec.style.display = isSpectator() ? "" : "none";
+  }
+
+  function renderState() {
+    if (!lastState) { stateEl.textContent = "(waiting for state)"; return; }
+
+    const lines = [];
+    const s = lastState;
+    lines.push(`Blinds: ${s.small_blind}/${s.big_blind}   Seats filled: ${s.seats.length}/${s.max_seats}`);
+    if (s.session_ended) lines.push("** SESSION ENDED **");
+
+    lines.push("");
+    lines.push("Seated:");
+    if (s.seats.length === 0) lines.push("  (none)");
+    for (const seat of s.seats) {
+      const tag = (s.hand && s.hand.button_seat === seat.seat) ? " [BTN]" : "";
+      lines.push(`  seat ${seat.seat}: ${seat.username}  stack=${seat.stack}${tag}`);
+    }
+
+    lines.push("");
+    lines.push(`Spectators: ${s.spectators.length ? s.spectators.join(", ") : "(none)"}`);
+
+    if (s.hand) {
+      const h = s.hand;
+      lines.push("");
+      lines.push(`--- Hand in progress ---`);
+      lines.push(`Street: ${h.street}`);
+      lines.push(`Board: ${h.board.length ? h.board.join(" ") : "(none)"}`);
+      lines.push(`Pot total: ${h.pot_total}   Current bet: ${h.current_bet}   Min raise: ${h.min_raise}`);
+      lines.push(`To act: ${h.to_act || "(none)"}`);
+      lines.push("");
+      lines.push("Players in hand:");
+      for (const p of h.players) {
+        const flags = [];
+        if (p.folded) flags.push("folded");
+        if (p.all_in) flags.push("all-in");
+        if (h.to_act === p.username) flags.push("<- to act");
+        lines.push(
+          `  ${p.username}  stack=${p.stack}  bet=${p.committed_street}  total=${p.committed_hand}` +
+          (flags.length ? `  [${flags.join(", ")}]` : "")
+        );
+      }
+      if (h.pots && h.pots.length) {
+        lines.push("");
+        lines.push("Pots:");
+        h.pots.forEach((pot, i) => {
+          lines.push(`  pot ${i}: ${pot.amount}  eligible=[${pot.eligible.join(", ")}]`);
+        });
+      }
+      if (h.winners && h.winners.length) {
+        lines.push("");
+        lines.push("Winners:");
+        for (const w of h.winners) {
+          lines.push(`  pot ${w.pot_idx}: ${w.usernames.join(", ")} wins ${w.amount}`);
+        }
+      }
+      if (h.history && h.history.length) {
+        lines.push("");
+        lines.push("Action history this hand:");
+        for (const a of h.history) {
+          lines.push(`  ${a.username} ${a.type}${a.amount ? " " + a.amount : ""}`);
+        }
+      }
+    } else {
+      lines.push("");
+      lines.push("(no hand in progress — host must `start` in the terminal)");
+    }
+
+    stateEl.textContent = lines.join("\n");
+  }
+
+  function renderActions() {
+    if (!isMyTurn() || !lastLegal) {
+      actionsSec.style.display = "none";
+      return;
+    }
+    actionsSec.style.display = "";
+    const la = lastLegal;
+    $("act-fold").disabled = false; // fold is always legal on your turn
+    $("act-check").disabled = !la.can_check;
+    $("act-call").disabled = !la.can_call;
+    $("act-call").textContent = la.can_call ? `Call ${la.call_amount}` : "Call";
+    $("act-bet").disabled = !la.can_bet;
+    $("act-raise").disabled = !la.can_raise;
+
+    const sizingLegal = la.can_bet || la.can_raise;
+    betInput.disabled = !sizingLegal;
+    if (sizingLegal) {
+      betInput.min = la.min_raise_to;
+      betInput.max = la.max_raise_to;
+      if (!betInput.value || Number(betInput.value) < la.min_raise_to || Number(betInput.value) > la.max_raise_to) {
+        betInput.value = la.min_raise_to;
+      }
+      betRange.textContent = ` (min ${la.min_raise_to}, max ${la.max_raise_to})`;
+    } else {
+      betRange.textContent = "";
+    }
+  }
+
+  function renderAll() {
+    renderRole();
+    renderState();
+    renderActions();
+  }
+
+  // ---------- event handlers ----------
+  $("join-btn").onclick = () => {
+    const u = $("username").value.trim();
+    const st = parseInt($("stack").value, 10);
+    if (!u || !st || st <= 0) { joinMsg.textContent = "enter username + positive stack"; return; }
+    socket.emit("join", { username: u, stack: st });
+  };
+
+  $("request-seat-btn").onclick = () => {
+    socket.emit("request_seat", { username });
+  };
+
+  $("act-fold").onclick = () => socket.emit("action", { username, action: "fold" });
+  $("act-check").onclick = () => socket.emit("action", { username, action: "check" });
+  $("act-call").onclick = () => socket.emit("action", { username, action: "call" });
+  $("act-bet").onclick = () => {
+    const amt = parseInt(betInput.value, 10);
+    socket.emit("action", { username, action: "bet", amount: amt });
+  };
+  $("act-raise").onclick = () => {
+    const amt = parseInt(betInput.value, 10);
+    socket.emit("action", { username, action: "raise", amount: amt });
+  };
+})();
+</script>
+</body>
+</html>

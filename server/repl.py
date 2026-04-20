@@ -26,12 +26,6 @@ Commands:
 """
 
 
-def _print(msg: str) -> None:
-    # Use \r so we don't clash with the prompt; then restore prompt.
-    sys.stdout.write("\r" + msg + "\n> ")
-    sys.stdout.flush()
-
-
 class HostRepl:
     def __init__(self, table: Table, on_exit: Callable[[], None]):
         self.table = table
@@ -52,9 +46,10 @@ class HostRepl:
                 sys.stdout.write("> ")
                 sys.stdout.flush()
                 continue
+            # Catch broadly: a handler bug must not kill the host's REPL thread.
             try:
                 self._dispatch(line)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 print(f"error: {e}")
             if self.table.session_ended:
                 print("Session ended. Shutting down.")
@@ -62,10 +57,6 @@ class HostRepl:
                 return
             sys.stdout.write("> ")
             sys.stdout.flush()
-
-    # ------------------------------------------------------------------
-    # Dispatch
-    # ------------------------------------------------------------------
 
     def _dispatch(self, line: str) -> None:
         parts = shlex.split(line)
@@ -78,9 +69,13 @@ class HostRepl:
             return
         handler(args)
 
-    # ------------------------------------------------------------------
-    # Commands
-    # ------------------------------------------------------------------
+    def _broadcast_state(self) -> None:
+        self.table.on_broadcast({"type": "state", "state": self.table.public_state()})
+
+    def _report(self, ok: bool, msg: str) -> None:
+        print(msg if ok else f"error: {msg}")
+        if ok:
+            self._broadcast_state()
 
     def cmd_help(self, args):
         print(HELP)
@@ -108,19 +103,13 @@ class HostRepl:
         if len(args) != 1:
             print("usage: approve <username>")
             return
-        ok, msg = self.table.host_approve(args[0])
-        print(msg if ok else f"error: {msg}")
-        if ok:
-            self.table.on_broadcast({"type": "state", "state": self.table.public_state()})
+        self._report(*self.table.host_approve(args[0]))
 
     def cmd_deny(self, args):
         if len(args) != 1:
             print("usage: deny <username>")
             return
-        ok, msg = self.table.host_deny(args[0])
-        print(msg if ok else f"error: {msg}")
-        if ok:
-            self.table.on_broadcast({"type": "state", "state": self.table.public_state()})
+        self._report(*self.table.host_deny(args[0]))
 
     def cmd_seat(self, args):
         if len(args) != 2:
@@ -131,16 +120,10 @@ class HostRepl:
         except ValueError:
             print("seat_num must be an integer")
             return
-        ok, msg = self.table.host_seat(args[0], n)
-        print(msg if ok else f"error: {msg}")
-        if ok:
-            self.table.on_broadcast({"type": "state", "state": self.table.public_state()})
+        self._report(*self.table.host_seat(args[0], n))
 
     def cmd_shuffle(self, args):
-        ok, msg = self.table.host_shuffle()
-        print(msg if ok else f"error: {msg}")
-        if ok:
-            self.table.on_broadcast({"type": "state", "state": self.table.public_state()})
+        self._report(*self.table.host_shuffle())
 
     def cmd_stack(self, args):
         if len(args) != 2:
@@ -151,10 +134,7 @@ class HostRepl:
         except ValueError:
             print("amount must be an integer")
             return
-        ok, msg = self.table.host_stack(args[0], n)
-        print(msg if ok else f"error: {msg}")
-        if ok:
-            self.table.on_broadcast({"type": "state", "state": self.table.public_state()})
+        self._report(*self.table.host_stack(args[0], n))
 
     def cmd_blinds(self, args):
         if len(args) != 2:
@@ -165,27 +145,20 @@ class HostRepl:
         except ValueError:
             print("blinds must be integers")
             return
-        ok, msg = self.table.host_blinds(sb, bb)
-        print(msg if ok else f"error: {msg}")
-        if ok:
-            self.table.on_broadcast({"type": "state", "state": self.table.public_state()})
+        self._report(*self.table.host_blinds(sb, bb))
 
     def cmd_kick(self, args):
         if len(args) != 1:
             print("usage: kick <username>")
             return
-        ok, msg = self.table.host_kick(args[0])
-        print(msg if ok else f"error: {msg}")
-        if ok:
-            self.table.on_broadcast({"type": "state", "state": self.table.public_state()})
+        self._report(*self.table.host_kick(args[0]))
 
     def cmd_start(self, args):
         ok, msg = self.table.host_start()
         print(msg if ok else f"error: {msg}")
 
     def cmd_end(self, args):
-        ok, final = self.table.host_end()
-        # Final stacks were already logged by host_end()
+        self.table.host_end()
 
 
 def start_repl(table: Table, on_exit: Callable[[], None]) -> threading.Thread:

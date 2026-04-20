@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from flask import Flask, send_from_directory
+from flask import Flask, request, send_from_directory
 from flask_socketio import SocketIO, emit
 
 from .logging_setup import setup_logging
@@ -16,16 +16,12 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 def create_app() -> tuple[Flask, SocketIO, Table]:
     host_log = setup_logging()
 
-    app = Flask(
-        __name__,
-        static_folder=str(STATIC_DIR),
-        static_url_path="",
-    )
+    app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="")
     app.config["SECRET_KEY"] = "poker-lan"  # LAN only; no auth surface worth protecting
 
     socketio = SocketIO(
         app,
-        async_mode="eventlet",
+        async_mode="threading",
         cors_allowed_origins="*",
         logger=False,
         engineio_logger=False,
@@ -39,10 +35,10 @@ def create_app() -> tuple[Flask, SocketIO, Table]:
         if sid:
             socketio.emit("private", payload, to=sid)
 
-    def host_log_event(msg: str) -> None:
-        host_log.info(msg)
+    table = Table(on_broadcast=broadcast, on_private=private, on_log=host_log.info)
 
-    table = Table(on_broadcast=broadcast, on_private=private, on_log=host_log_event)
+    def broadcast_state() -> None:
+        broadcast({"type": "state", "state": table.public_state()})
 
     @app.route("/")
     def index():
@@ -50,34 +46,34 @@ def create_app() -> tuple[Flask, SocketIO, Table]:
 
     @socketio.on("connect")
     def on_connect():
-        from flask import request
         table.connect(request.sid)
         emit("table", {"type": "state", "state": table.public_state(), "new_hand": False})
 
     @socketio.on("disconnect")
     def on_disconnect():
-        from flask import request
         table.disconnect(request.sid)
 
     @socketio.on("hello")
     def on_hello(data):
-        from flask import request
         username = (data or {}).get("username", "")
         if username and table.attach_username(request.sid, username):
+            emit("hello_result", {"ok": True, "username": username})
             emit("table", {"type": "state", "state": table.public_state(), "new_hand": False})
             hole = table.hole_for(username)
             if hole:
                 emit("private", {"type": "hole", "cards": hole})
+        else:
+            emit("hello_result", {"ok": False})
 
     @socketio.on("join")
     def on_join(data):
-        from flask import request
-        username = (data or {}).get("username", "")
-        stack = int((data or {}).get("stack", 0))
+        data = data or {}
+        username = data.get("username", "")
+        stack = int(data.get("stack", 0))
         ok, msg = table.request_join(request.sid, username, stack)
         emit("join_result", {"ok": ok, "message": msg, "username": username if ok else None})
         if ok:
-            socketio.emit("table", {"type": "state", "state": table.public_state()})
+            broadcast_state()
 
     @socketio.on("request_seat")
     def on_request_seat(data):
@@ -85,13 +81,14 @@ def create_app() -> tuple[Flask, SocketIO, Table]:
         ok, msg = table.request_seat(username)
         emit("action_result", {"ok": ok, "message": msg})
         if ok:
-            socketio.emit("table", {"type": "state", "state": table.public_state()})
+            broadcast_state()
 
     @socketio.on("action")
     def on_action(data):
-        username = (data or {}).get("username", "")
-        action = (data or {}).get("action", "")
-        amount = int((data or {}).get("amount", 0))
+        data = data or {}
+        username = data.get("username", "")
+        action = data.get("action", "")
+        amount = int(data.get("amount", 0))
         ok, msg = table.player_action(username, action, amount)
         emit("action_result", {"ok": ok, "message": msg})
 

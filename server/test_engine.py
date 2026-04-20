@@ -1,25 +1,20 @@
 """Sanity tests for the NLHE engine."""
 
 import random
+
 import pytest
 
 from server.engine import (
     ActionType,
     HandState,
     PlayerState,
-    Pot,
     Street,
     _build_pots,
     _evaluate,
     apply_action,
-    legal_actions,
     start_hand,
 )
 
-
-# ---------------------------------------------------------------------------
-# Hand evaluation
-# ---------------------------------------------------------------------------
 
 def test_royal_flush_beats_straight_flush():
     royal = _evaluate(["As", "Ks"], ["Qs", "Js", "Ts", "2h", "3d"])
@@ -38,10 +33,6 @@ def test_tie_same_straight():
     b = _evaluate(["9c", "8h"], ["7h", "6c", "5d", "2h", "3s"])
     assert a == b
 
-
-# ---------------------------------------------------------------------------
-# Side pots
-# ---------------------------------------------------------------------------
 
 def _mk(name, stack, committed, folded=False):
     p = PlayerState(seat=0, username=name, stack=stack)
@@ -104,10 +95,6 @@ def test_three_way_all_in_different_stacks():
     assert pots[1].amount == 100 and pots[1].eligible == {"b", "c"}
     assert pots[2].amount == 100 and pots[2].eligible == {"c"}
 
-
-# ---------------------------------------------------------------------------
-# Betting round progression
-# ---------------------------------------------------------------------------
 
 def test_preflop_3way_fold_around_bb_wins():
     rng = random.Random(42)

@@ -8,8 +8,9 @@ through methods guarded by a single RLock. Keep critical sections short.
 
 from __future__ import annotations
 
+import random
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Optional
 
 from .engine import (
@@ -23,6 +24,20 @@ from .engine import (
 )
 
 MAX_SEATS = 10
+
+
+def _format_action(action: str, amount: int) -> str:
+    if action == "fold":
+        return "folds"
+    if action == "check":
+        return "checks"
+    if action == "call":
+        return f"calls {amount}"
+    if action == "bet":
+        return f"bets {amount}"
+    if action == "raise":
+        return f"raises to {amount}"
+    return action
 
 
 @dataclass
@@ -42,9 +57,9 @@ class Seat:
 @dataclass
 class PendingRequest:
     username: str
-    requested_stack: int     # chips asked for on initial join; ignored on reseat (we keep prior stack = 0 for busted)
-    kind: str                # "join" or "seat"
-    sid: str                 # connection socket id that made the request
+    requested_stack: int
+    kind: str  # "join" or "seat"
+    sid: str
 
 
 class Table:
@@ -76,13 +91,13 @@ class Table:
 
         self.small_blind = 5
         self.big_blind = 10
-        self.button_seat: Optional[int] = None        # last hand's button; rotates forward next hand
+        self.button_seat: Optional[int] = None
         self.hand: Optional[HandState] = None
         self.session_ended = False
 
-    # ------------------------------------------------------------------
-    # Connection lifecycle
-    # ------------------------------------------------------------------
+    @property
+    def _hand_in_progress(self) -> bool:
+        return self.hand is not None and self.hand.street != Street.COMPLETE
 
     def connect(self, sid: str) -> None:
         with self.lock:
@@ -108,17 +123,11 @@ class Table:
             return True
 
     def _known_username(self, username: str) -> bool:
-        if any(s.username == username for s in self.seats.values()):
-            return True
-        if username in self.spectators:
-            return True
-        if any(r.username == username for r in self.pending):
-            return True
-        return False
-
-    # ------------------------------------------------------------------
-    # Join / seat requests
-    # ------------------------------------------------------------------
+        return (
+            any(s.username == username for s in self.seats.values())
+            or username in self.spectators
+            or any(r.username == username for r in self.pending)
+        )
 
     def request_join(self, sid: str, username: str, requested_stack: int) -> tuple[bool, str]:
         """Initial join from landing page. Returns (ok, message)."""
@@ -162,10 +171,6 @@ class Table:
             self.log(f"SEAT REQUEST: {username}")
             return True, "waiting for host approval"
 
-    # ------------------------------------------------------------------
-    # Host commands
-    # ------------------------------------------------------------------
-
     def host_approve(self, username: str) -> tuple[bool, str]:
         with self.lock:
             req = next((r for r in self.pending if r.username == username), None)
@@ -175,20 +180,17 @@ class Table:
 
             seat_num = self._first_free_seat()
             if seat_num is None:
-                # No seats: put them in spectators. They can request a seat later.
                 self.spectators.add(username)
                 self.log(f"APPROVED: {username} -> spectator (table full)")
+            elif req.kind == "join":
+                self.seats[seat_num] = Seat(username=username, stack=req.requested_stack)
+                self.log(f"APPROVED: {username} -> seat {seat_num} with {req.requested_stack}")
             else:
-                if req.kind == "join":
-                    self.seats[seat_num] = Seat(username=username, stack=req.requested_stack)
-                    self.log(f"APPROVED: {username} -> seat {seat_num} with {req.requested_stack}")
-                else:
-                    # Rebuy on seat request: host must `stack` to set chips, OR we default to last requested.
-                    # Simpler: reuse small_blind*100 default for rebuy. Host can adjust via `stack`.
-                    default_stack = self.big_blind * 100
-                    self.seats[seat_num] = Seat(username=username, stack=default_stack)
-                    self.spectators.discard(username)
-                    self.log(f"APPROVED: {username} -> seat {seat_num} (rebuy {default_stack})")
+                # Rebuy: default to 100 BBs; host can adjust via `stack`.
+                default_stack = self.big_blind * 100
+                self.seats[seat_num] = Seat(username=username, stack=default_stack)
+                self.spectators.discard(username)
+                self.log(f"APPROVED: {username} -> seat {seat_num} (rebuy {default_stack})")
             return True, "ok"
 
     def host_deny(self, username: str) -> tuple[bool, str]:
@@ -216,19 +218,19 @@ class Table:
 
     def host_seat(self, username: str, seat_num: int) -> tuple[bool, str]:
         with self.lock:
-            if self.hand and self.hand.street != Street.COMPLETE:
+            if self._hand_in_progress:
                 return False, "cannot change seats during a hand"
-            if not (1 <= seat_num <= MAX_SEATS):
+            if not 1 <= seat_num <= MAX_SEATS:
                 return False, f"seat must be 1..{MAX_SEATS}"
-            # Find player: they may be already seated, or spectating.
-            current_seat = next((s for s, seat in self.seats.items() if seat.username == username), None)
+            current_seat = next(
+                (s for s, seat in self.seats.items() if seat.username == username),
+                None,
+            )
             if seat_num in self.seats and self.seats[seat_num].username != username:
                 return False, f"seat {seat_num} is occupied"
             if current_seat is not None:
-                seat_obj = self.seats.pop(current_seat)
-                self.seats[seat_num] = seat_obj
+                self.seats[seat_num] = self.seats.pop(current_seat)
             elif username in self.spectators:
-                # Need stack: default to big_blind*100
                 self.seats[seat_num] = Seat(username=username, stack=self.big_blind * 100)
                 self.spectators.discard(username)
             else:
@@ -237,24 +239,23 @@ class Table:
             return True, "ok"
 
     def host_shuffle(self) -> tuple[bool, str]:
-        import random as _r
         with self.lock:
-            if self.hand and self.hand.street != Street.COMPLETE:
+            if self._hand_in_progress:
                 return False, "cannot shuffle during a hand"
             names = [s.username for s in self.seats.values()]
             stacks = {s.username: s.stack for s in self.seats.values()}
-            _r.shuffle(names)
+            random.shuffle(names)
             seat_nums = sorted(self.seats.keys())
-            self.seats = {}
-            # Reassign using the previously used seat numbers (keeps numbering stable)
-            for num, name in zip(seat_nums, names):
-                self.seats[num] = Seat(username=name, stack=stacks[name])
+            self.seats = {
+                num: Seat(username=name, stack=stacks[name])
+                for num, name in zip(seat_nums, names)
+            }
             self.log(f"SHUFFLE: {', '.join(f'{n}->{s.username}' for n, s in self.seats.items())}")
             return True, "ok"
 
     def host_stack(self, username: str, amount: int) -> tuple[bool, str]:
         with self.lock:
-            if self.hand and self.hand.street != Street.COMPLETE:
+            if self._hand_in_progress:
                 return False, "cannot adjust stacks during a hand"
             if amount < 0:
                 return False, "stack cannot be negative"
@@ -267,7 +268,7 @@ class Table:
 
     def host_blinds(self, sb: int, bb: int) -> tuple[bool, str]:
         with self.lock:
-            if self.hand and self.hand.street != Street.COMPLETE:
+            if self._hand_in_progress:
                 return False, "cannot change blinds during a hand"
             if sb <= 0 or bb <= 0 or bb < sb:
                 return False, "invalid blinds"
@@ -277,12 +278,14 @@ class Table:
             return True, "ok"
 
     def host_kick(self, username: str) -> tuple[bool, str]:
-        """Kick: chips forfeit, player removed entirely (per spec decision)."""
+        """Remove a player from the table; their chips are forfeit."""
         with self.lock:
-            if self.hand and self.hand.street != Street.COMPLETE:
+            if self._hand_in_progress:
                 return False, "cannot kick during a hand"
-            # Remove from seats/spectators/pending.
-            seat_num = next((s for s, seat in self.seats.items() if seat.username == username), None)
+            seat_num = next(
+                (s for s, seat in self.seats.items() if seat.username == username),
+                None,
+            )
             if seat_num is not None:
                 self.seats.pop(seat_num)
             self.spectators.discard(username)
@@ -292,23 +295,20 @@ class Table:
 
     def host_start(self) -> tuple[bool, str]:
         with self.lock:
-            if self.hand and self.hand.street != Street.COMPLETE:
+            if self._hand_in_progress:
                 return False, "hand already in progress"
             playable = [(s, seat) for s, seat in self.seats.items() if seat.stack > 0]
             if len(playable) < 2:
                 return False, "need at least 2 seated players with chips"
 
-            # Rotate button: next seat clockwise from previous button among playable seats.
-            seats_sorted = sorted(self.seats.keys())
-            playable_seats = sorted(s for s, seat in playable)
+            playable_seats = sorted(s for s, _ in playable)
             if self.button_seat is None:
-                next_button = playable_seats[0]
+                self.button_seat = playable_seats[0]
             else:
-                next_button = next(
+                self.button_seat = next(
                     (s for s in playable_seats if s > self.button_seat),
                     playable_seats[0],
                 )
-            self.button_seat = next_button
 
             seated_for_hand = [(s, seat.username, seat.stack) for s, seat in playable]
             self.hand = start_hand(
@@ -317,11 +317,12 @@ class Table:
                 small_blind=self.small_blind,
                 big_blind=self.big_blind,
             )
-            self.log(f"HAND START: button=seat{self.button_seat}, players=[{', '.join(n for _,n,_ in seated_for_hand)}]")
+            names = ", ".join(n for _, n, _ in seated_for_hand)
+            self.log(f"HAND START: button=seat{self.button_seat}, players=[{names}]")
             self._broadcast_state(new_hand=True)
             return True, "ok"
 
-    def host_end(self) -> tuple[bool, dict]:
+    def host_end(self) -> dict:
         with self.lock:
             self.session_ended = True
             final = self.host_players()
@@ -331,15 +332,11 @@ class Table:
             for u in final["spectators"]:
                 self.log(f"  spectator: {u}")
             self.on_broadcast({"type": "session_ended", "final": final})
-            return True, final
-
-    # ------------------------------------------------------------------
-    # Player actions (during a hand)
-    # ------------------------------------------------------------------
+            return final
 
     def player_action(self, username: str, action: str, amount: int = 0) -> tuple[bool, str]:
         with self.lock:
-            if not self.hand or self.hand.street in (Street.COMPLETE,):
+            if not self.hand or self.hand.street == Street.COMPLETE:
                 return False, "no active hand"
             try:
                 atype = ActionType(action)
@@ -350,35 +347,29 @@ class Table:
             except (ValueError, KeyError) as e:
                 return False, str(e)
 
-            log_bits = {"fold": "folds", "check": "checks", "call": f"calls {amount}",
-                        "bet": f"bets {amount}", "raise": f"raises to {amount}"}
-            self.log(f"ACTION: {username} {log_bits.get(action, action)}")
+            self.log(f"ACTION: {username} {_format_action(action, amount)}")
 
-            # If hand completed, sync stacks back into seats and handle busts.
             if self.hand.street == Street.COMPLETE:
                 self._settle_hand()
             self._broadcast_state()
             return True, "ok"
 
     def _settle_hand(self) -> None:
-        """Copy final stacks from hand back into seats, bust players to spectators."""
+        """Copy final stacks back into seats; busted players become spectators."""
         for p in self.hand.players:
-            seat_num = next((s for s, seat in self.seats.items() if seat.username == p.username), None)
+            seat_num = next(
+                (s for s, seat in self.seats.items() if seat.username == p.username),
+                None,
+            )
             if seat_num is None:
                 continue
             self.seats[seat_num].stack = p.stack
             if p.stack == 0:
-                # Bust -> spectator
                 self.seats.pop(seat_num)
                 self.spectators.add(p.username)
                 self.log(f"BUST: {p.username} -> spectator")
-        if self.hand.winners:
-            for w in self.hand.winners:
-                self.log(f"WINNER: {', '.join(w['usernames'])} wins {w['amount']} (pot {w['pot_idx']})")
-
-    # ------------------------------------------------------------------
-    # Snapshots & broadcasting
-    # ------------------------------------------------------------------
+        for w in self.hand.winners:
+            self.log(f"WINNER: {', '.join(w['usernames'])} wins {w['amount']} (pot {w['pot_idx']})")
 
     def _first_free_seat(self) -> Optional[int]:
         for i in range(1, MAX_SEATS + 1):

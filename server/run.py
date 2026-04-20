@@ -5,21 +5,18 @@ from __future__ import annotations
 import argparse
 import os
 import socket
-import sys
 
 from .app import create_app
 from .repl import start_repl
 
 
 def _lan_ip() -> str:
-    """Best-effort: discover the machine's LAN IP to print for convenience."""
+    """Best-effort local LAN IP, used only to print a connect URL for the host."""
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except OSError:
         return "127.0.0.1"
 
 
@@ -31,16 +28,18 @@ def main() -> None:
 
     app, socketio, table = create_app()
 
-    lan = _lan_ip()
-    print(f"Poker server starting on http://{lan}:{args.port}")
+    print(f"Poker server starting on http://{_lan_ip()}:{args.port}")
     print("Other devices on your hotspot/LAN should open that URL in a browser.\n")
 
-    def shutdown():
-        os._exit(0)
-
-    start_repl(table, on_exit=shutdown)
-
-    socketio.run(app, host=args.host, port=args.port, debug=False, use_reloader=False)
+    start_repl(table, on_exit=lambda: os._exit(0))
+    socketio.run(
+        app,
+        host=args.host,
+        port=args.port,
+        debug=False,
+        use_reloader=False,
+        allow_unsafe_werkzeug=True,
+    )
 
 
 if __name__ == "__main__":
